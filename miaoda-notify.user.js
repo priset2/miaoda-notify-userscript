@@ -1,13 +1,15 @@
 // ==UserScript==
-// @name         秒哒对话完成提醒
+// @name         秒哒 / MeDo 对话完成提醒
 // @namespace    https://github.com/YOUR_GITHUB_USERNAME
-// @version      1.3.0
-// @description  秒哒对话完成后触发系统通知，支持测试按钮显隐控制
+// @version      1.5.0
+// @description  Compatible with 秒哒 (CN) and MeDo (EN). Notify when a conversation is finished, but do not notify if the user has already returned to the page.
 // @author       YOUR_GITHUB_USERNAME
 // @match        *://www.miaoda.cn/*
 // @match        *://miaoda.cn/*
 // @match        *://*.appmiaoda.com/*
 // @match        *://appmiaoda.com/*
+// @match        *://medo.dev/*
+// @match        *://*.medo.dev/*
 // @include      *://*miaoda*/*
 // @run-at       document-idle
 // @grant        GM_notification
@@ -23,17 +25,49 @@
 (function () {
   'use strict';
 
+  const SITE = detectSiteProfile();
+
   const CONFIG = {
     pollMs: 800,
     blinkInterval: 850,
     blinkTimes: 36,
     cooldownMs: 5000,
     debug: true,
-    notificationTitle: '秒哒',
-    notificationText: '本次对话已完成，请返回页面查看结果并开始下一轮。',
-    testButtonText: '通知测试',
-    testButtonStorageKey: 'miaoda_show_test_button'
+    testButtonStorageKey: 'miaoda_show_test_button',
+    notifyDelayMs: 1200,
+    minHiddenMs: 1500
   };
+
+  const I18N = {
+    zh: {
+      appName: '秒哒',
+      notifyTitle: '秒哒',
+      notifyText: '本次对话已完成，请返回页面查看结果并开始下一轮。',
+      testNotifyTitle: '秒哒通知测试',
+      testNotifyText: '如果你看到了这条系统通知，说明通知链路已经打通。',
+      testButtonText: '通知测试',
+      blinkTitle: '【对话完成，快回来】秒哒',
+      menuToggle: '切换通知测试按钮显示/隐藏',
+      alertText:
+        '通知测试未成功。\n\n请检查：\n1. 浏览器站点通知是否允许；\n2. macOS 系统设置 -> 通知 -> 浏览器 是否开启；\n3. Tampermonkey 是否正确授予 GM_notification。',
+      logPrefix: '[秒哒提醒]'
+    },
+    en: {
+      appName: 'MeDo',
+      notifyTitle: 'MeDo',
+      notifyText: 'This conversation is complete. Please return to review the result and start the next round.',
+      testNotifyTitle: 'MeDo Notification Test',
+      testNotifyText: 'If you can see this system notification, the notification pipeline is working.',
+      testButtonText: 'Test Notify',
+      blinkTitle: '[Conversation complete] Come back to MeDo',
+      menuToggle: 'Toggle notification test button',
+      alertText:
+        'Notification test failed.\n\nPlease check:\n1. Site notification permission is allowed in your browser;\n2. Browser notifications are enabled in macOS System Settings;\n3. Tampermonkey has granted GM_notification correctly.',
+      logPrefix: '[MeDo Notify]'
+    }
+  };
+
+  const TEXT = I18N[SITE.lang];
 
   const STATE = {
     previous: 'unknown',
@@ -43,18 +77,34 @@
     lastNotifyAt: 0,
     loopTimer: null,
     showTestButton: true,
-    menuRegistered: false
+    menuRegistered: false,
+    pendingNotifyTimer: null,
+    hiddenSince: null,
+    lastVisibleAt: Date.now()
   };
 
+  function detectSiteProfile() {
+    const host = location.hostname.toLowerCase();
+    const htmlLang = (document.documentElement.getAttribute('lang') || '').toLowerCase();
+
+    const isEnglishHost = host.includes('medo.dev');
+    const isEnglishLang = htmlLang.startsWith('en');
+
+    if (isEnglishHost || isEnglishLang) {
+      return { lang: 'en', hostType: 'medo' };
+    }
+    return { lang: 'zh', hostType: 'miaoda' };
+  }
+
   function log(...args) {
-    if (CONFIG.debug) console.log('[秒哒提醒]', ...args);
+    if (CONFIG.debug) console.log(TEXT.logPrefix, ...args);
   }
 
   function getStoredShowTestButton() {
     try {
       return Boolean(GM_getValue(CONFIG.testButtonStorageKey, true));
     } catch (err) {
-      log('读取测试按钮配置失败，使用默认值 true', err);
+      log('Failed to read test button config, fallback to true.', err);
       return true;
     }
   }
@@ -63,7 +113,7 @@
     try {
       GM_setValue(CONFIG.testButtonStorageKey, Boolean(value));
     } catch (err) {
-      log('保存测试按钮配置失败', err);
+      log('Failed to save test button config.', err);
     }
   }
 
@@ -71,20 +121,16 @@
     if (STATE.menuRegistered) return;
 
     try {
-      GM_registerMenuCommand('切换通知测试按钮显示/隐藏', () => {
+      GM_registerMenuCommand(TEXT.menuToggle, () => {
         STATE.showTestButton = !STATE.showTestButton;
         setStoredShowTestButton(STATE.showTestButton);
         syncTestButtonVisibility();
-        log('测试按钮显示状态已切换为:', STATE.showTestButton);
+        log('Test button visibility switched to:', STATE.showTestButton);
       });
       STATE.menuRegistered = true;
     } catch (err) {
-      log('注册菜单命令失败', err);
+      log('Failed to register menu command.', err);
     }
-  }
-
-  function isForeground() {
-    return document.visibilityState === 'visible' && document.hasFocus();
   }
 
   function stopBlink() {
@@ -101,7 +147,7 @@
 
     STATE.blinkTimer = setInterval(() => {
       document.title = document.title === STATE.originalTitle
-        ? '【对话完成，快回来】秒哒'
+        ? TEXT.blinkTitle
         : STATE.originalTitle;
 
       STATE.blinkCount += 1;
@@ -109,6 +155,27 @@
         stopBlink();
       }
     }, CONFIG.blinkInterval);
+  }
+
+  function clearPendingNotification() {
+    if (STATE.pendingNotifyTimer) {
+      clearTimeout(STATE.pendingNotifyTimer);
+      STATE.pendingNotifyTimer = null;
+      log('Pending notification cancelled.');
+    }
+  }
+
+  function isPageReallyHidden() {
+    return document.visibilityState === 'hidden' || !document.hasFocus();
+  }
+
+  function initVisibilityState() {
+    if (isPageReallyHidden()) {
+      STATE.hiddenSince = Date.now();
+    } else {
+      STATE.hiddenSince = null;
+      STATE.lastVisibleAt = Date.now();
+    }
   }
 
   function normalizeD(d) {
@@ -120,8 +187,8 @@
     return (
       rect.width > 16 &&
       rect.height > 16 &&
-      rect.right > window.innerWidth - 240 &&
-      rect.bottom > window.innerHeight - 240
+      rect.right > window.innerWidth - 260 &&
+      rect.bottom > window.innerHeight - 260
     );
   }
 
@@ -142,7 +209,7 @@
   }
 
   function findSendControl() {
-    const paths = Array.from(document.querySelectorAll('svg.ChatUI-icon path'));
+    const paths = Array.from(document.querySelectorAll('svg path'));
     for (const path of paths) {
       if (!isSendArrowPath(path)) continue;
       const host = path.closest('button, span, [role="button"]');
@@ -154,10 +221,12 @@
   }
 
   function findStopControl() {
-    const rects = Array.from(document.querySelectorAll('svg.ChatUI-icon rect'));
+    const rects = Array.from(document.querySelectorAll('svg rect'));
     for (const rect of rects) {
       if (!isStopRect(rect)) continue;
-      const host = rect.closest('.ChatBox-user-input-stop-button, .LuiChatBox-user-input-stop-button, span, button, [role="button"]');
+      const host = rect.closest(
+        '.ChatBox-user-input-stop-button, .LuiChatBox-user-input-stop-button, button, span, [role="button"]'
+      );
       if (!host) continue;
       if (!inBottomRight(host)) continue;
       return host;
@@ -177,33 +246,33 @@
 
   async function requestWebNotificationPermission(force = false) {
     if (!('Notification' in window)) {
-      log('当前浏览器不支持 Notification API');
+      log('Notification API is not supported in this browser.');
       return false;
     }
 
     if (Notification.permission === 'granted') {
-      log('网页通知权限已授予');
+      log('Web notification permission has been granted.');
       return true;
     }
 
     if (Notification.permission === 'denied' && !force) {
-      log('网页通知权限已被拒绝');
+      log('Web notification permission has been denied.');
       return false;
     }
 
     try {
       const result = await Notification.requestPermission();
-      log('Notification.requestPermission 结果:', result);
+      log('Notification.requestPermission result:', result);
       return result === 'granted';
     } catch (err) {
-      log('请求网页通知权限失败', err);
+      log('Failed to request notification permission.', err);
       return false;
     }
   }
 
   function sendGMNotification(title, text) {
     if (typeof GM_notification !== 'function') {
-      log('GM_notification 不可用');
+      log('GM_notification is unavailable.');
       return false;
     }
 
@@ -218,26 +287,26 @@
           window.focus();
         },
         ondone: function () {
-          log('GM_notification 已关闭');
+          log('GM_notification closed.');
         }
       });
-      log('已触发 GM_notification');
+      log('GM_notification triggered.');
       return true;
     } catch (err) {
-      log('GM_notification 调用失败', err);
+      log('GM_notification failed.', err);
       return false;
     }
   }
 
   async function sendWebNotification(title, text) {
     if (!('Notification' in window)) {
-      log('当前页面不支持原生 Notification');
+      log('Native Notification is unavailable.');
       return false;
     }
 
     const ok = await requestWebNotificationPermission(false);
     if (!ok) {
-      log('原生 Notification 未获权限');
+      log('Native Notification permission not granted.');
       return false;
     }
 
@@ -245,7 +314,7 @@
       const n = new Notification(title, {
         body: text,
         silent: true,
-        tag: 'miaoda-chat-done'
+        tag: 'medo-miaoda-chat-done'
       });
 
       n.onclick = () => {
@@ -253,10 +322,10 @@
         n.close();
       };
 
-      log('已触发原生 Notification');
+      log('Native Notification triggered.');
       return true;
     } catch (err) {
-      log('原生 Notification 调用失败', err);
+      log('Native Notification failed.', err);
       return false;
     }
   }
@@ -270,26 +339,27 @@
     }
 
     if (!ok) {
-      log('系统通知未成功触发');
+      log('No system notification was successfully triggered.');
     }
 
     return ok;
   }
 
   async function testNotificationFlow() {
-    log('开始测试通知链路');
+    log('Testing notification pipeline...');
     const permissionOk = await requestWebNotificationPermission(true);
-    log('测试按钮权限结果:', permissionOk ? 'granted' : (window.Notification ? Notification.permission : 'unsupported'));
+    log(
+      'Test button permission result:',
+      permissionOk ? 'granted' : (window.Notification ? Notification.permission : 'unsupported')
+    );
 
     const ok = await fireSystemNotification(
-      '秒哒通知测试',
-      '如果你看到了这条系统通知，说明通知链路已经打通。'
+      TEXT.testNotifyTitle,
+      TEXT.testNotifyText
     );
 
     if (!ok) {
-      alert(
-        '通知测试未成功。\n\n请检查：\n1. 浏览器站点通知是否允许；\n2. macOS 系统设置 -> 通知 -> 浏览器 是否开启；\n3. Tampermonkey 是否正确授予 GM_notification。'
-      );
+      alert(TEXT.alertText);
     }
   }
 
@@ -297,8 +367,8 @@
     const btn = document.createElement('button');
     btn.id = '__miaoda_test_notify_btn__';
     btn.type = 'button';
-    btn.textContent = CONFIG.testButtonText;
-    btn.setAttribute('aria-label', '测试秒哒系统通知');
+    btn.textContent = TEXT.testButtonText;
+    btn.setAttribute('aria-label', TEXT.testButtonText);
     btn.style.cssText = `
       position: fixed;
       right: 18px;
@@ -330,7 +400,7 @@
     if (!btn) {
       btn = createTestButton();
       document.body.appendChild(btn);
-      log('测试按钮已插入');
+      log('Test button inserted.');
     }
 
     return btn;
@@ -345,22 +415,41 @@
   async function notifyDone() {
     const now = Date.now();
     if (now - STATE.lastNotifyAt < CONFIG.cooldownMs) return;
-    STATE.lastNotifyAt = now;
 
-    log('准备发送完成通知');
-    await fireSystemNotification(CONFIG.notificationTitle, CONFIG.notificationText);
-    startBlink();
+    clearPendingNotification();
+
+    STATE.pendingNotifyTimer = setTimeout(async () => {
+      STATE.pendingNotifyTimer = null;
+
+      const stillHidden = isPageReallyHidden();
+      const hiddenDuration = STATE.hiddenSince ? (Date.now() - STATE.hiddenSince) : 0;
+
+      if (!stillHidden) {
+        log('Skip notification because user is already back on the page.');
+        return;
+      }
+
+      if (hiddenDuration < CONFIG.minHiddenMs) {
+        log('Skip notification because hidden duration is too short:', hiddenDuration);
+        return;
+      }
+
+      STATE.lastNotifyAt = Date.now();
+      log('Preparing completion notification...');
+      await fireSystemNotification(TEXT.notifyTitle, TEXT.notifyText);
+      startBlink();
+    }, CONFIG.notifyDelayMs);
   }
 
   function tick() {
     const current = detectState();
 
     if (current !== STATE.previous) {
-      log('状态变化:', STATE.previous, '->', current);
+      log('State changed:', STATE.previous, '->', current);
     }
 
     if (STATE.previous === 'running' && current === 'idle') {
-      log('检测到对话完成，触发系统通知');
+      log('Conversation finished. Queueing notification.');
       notifyDone();
     }
 
@@ -371,11 +460,12 @@
   function init() {
     if (STATE.loopTimer) return;
 
+    initVisibilityState();
     STATE.showTestButton = getStoredShowTestButton();
     registerMenu();
     syncTestButtonVisibility();
 
-    log('脚本已注入');
+    log('Script injected for site:', SITE.hostType);
     tick();
     STATE.loopTimer = setInterval(tick, CONFIG.pollMs);
     setTimeout(tick, 500);
@@ -383,12 +473,29 @@
   }
 
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') {
+    if (document.visibilityState === 'hidden') {
+      STATE.hiddenSince = Date.now();
+      log('Page hidden.');
+    } else {
+      STATE.lastVisibleAt = Date.now();
+      STATE.hiddenSince = null;
+      clearPendingNotification();
       stopBlink();
+      log('Page visible, cancel notification if pending.');
     }
   });
 
-  window.addEventListener('focus', stopBlink);
+  window.addEventListener('focus', () => {
+    STATE.lastVisibleAt = Date.now();
+    STATE.hiddenSince = null;
+    clearPendingNotification();
+    stopBlink();
+  });
+
+  window.addEventListener('blur', () => {
+    STATE.hiddenSince = Date.now();
+  });
+
   window.addEventListener('load', init);
   setTimeout(init, 1200);
 })();
